@@ -1,0 +1,28 @@
+# Keys & Secrets
+*.pem
+*.key
+*.env
+.env.*
+.env
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+npm-debug.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Temp
+tmp_*
+*.bak
+*.bak.*
