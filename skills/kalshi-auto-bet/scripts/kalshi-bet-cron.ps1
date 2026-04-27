@@ -118,6 +118,35 @@ $Targets = @(
     @{Ticker="KXIPOSPACEX-26MAY01"; Desc="SpaceX IPO by May 1"}
 )
 
+# === 5b. Auto-discover MLB games closing within 48 hours ===
+try {
+    $mlbResp = Invoke-RestMethod -Uri "https://api.elections.kalshi.com/trade-api/v2/events?limit=100&status=open&tickers_prefix=KXMLBGAME" -ErrorAction SilentlyContinue
+    if ($mlbResp.events) {
+        $cutoff48h = (Get-Date).AddHours(48).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $recentMlb = $mlbResp.events | Where-Object {
+            $_.close_time -and $_.close_time -ne "" -and $_.close_time -le $cutoff48h
+        }
+        foreach ($evt in $recentMlb) {
+            # For each qualifying event, get its markets (team game-winner markets)
+            $evtMarkets = Invoke-RestMethod -Uri "https://api.elections.kalshi.com/trade-api/v2/markets?limit=50&tickers_prefix=$($evt.ticker)" -ErrorAction SilentlyContinue
+            if ($evtMarkets.markets) {
+                foreach ($mkt in $evtMarkets.markets) {
+                    if ($mkt.ticker -match "^KXMLBGAME-.{8,24}-[A-Z]{3,4}$" -and $mkt.status -eq "active" -and $mkt.volume_24h_fp -gt 1000) {
+                        $bid = [decimal]($mkt.yes_bid -replace '^"|"$','')
+                        $ask = [decimal]($mkt.yes_ask -replace '^"|"$','')
+                        if ($bid -gt 0.01 -and $ask -le 0.80 -and $bid -le 0.50) {
+                            $existing = $Targets | Where-Object { $_.Ticker -eq $mkt.ticker }
+                            if (-not $existing) {
+                                $Targets += @{Ticker=$mkt.ticker; Desc="MLB $($mkt.ticker -replace '^.*-','') underdog (ask=$([Math]::Round($ask*100)c))"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+} catch { Write-Log "MLB discovery error: $_" }
+
 $TotalBet = 0
 $Placed = 0
 
