@@ -93,6 +93,7 @@ function Test-CanBet {
     $base = $Ticker -replace '-[^-]+$',''
     if ($PlacedTickers.ContainsKey($Ticker)) { return $false, "Already has resting order" }
     if ($PositionTickers.ContainsKey($base)) { return $false, "Position exists in $base" }
+    if ($BasesPlaced.ContainsKey($base)) { return $false, "Already bet $base this run (dual-bet prevention)" }
     return $true, ""
 }
 
@@ -149,6 +150,7 @@ try {
 
 $TotalBet = 0
 $Placed = 0
+$BasesPlaced = @{}  # Track base markets placed this run (prevents both-sides betting)
 
 foreach ($Target in $Targets) {
     if ($TotalBet -ge $MaxBudget) {
@@ -229,6 +231,8 @@ foreach ($Target in $Targets) {
             Write-Log "ORDER PLACED: $Ticker x $TargetShares @ $( $bidPrice )c"
             $Placed++
             $TotalBet += $Cost
+            $base = $Ticker -replace '-[^-]+$',''
+            $BasesPlaced[$base] = $true
         } elseif ($Result -match '"status": "canceled"' -or $Result -match '"status": "rejected"') {
             Write-Log "ORDER REJECTED: $Ticker - $Result"
         } else {
