@@ -121,14 +121,32 @@ def get_base_market(ticker):
     return parts[0] if len(parts) > 1 else ticker
 
 
+def get_existing_positions_by_base(client):
+    """Fetch open positions and group by base market"""
+    try:
+        positions = client.get_positions()
+        bases = {}
+        for mp in positions.get('market_positions', []):
+            t = mp.get('ticker', '')
+            base = get_base_market(t)
+            pos = float(mp.get('position_fp', 0))
+            if base not in bases:
+                bases[base] = []
+            bases[base].append({'ticker': t, 'position': pos})
+        return bases
+    except Exception as e:
+        print(f"Position check error: {e}", flush=True)
+        return {}
+
+
 def estimate_true_probability(ticker, market_price_cents, category):
     """
     Estimate true win probability without external APIs.
-    Key insight from P&L data: winning categories (EPL, UCL) are profitable 
+    Key insight from P&L data: winning categories (EPL, UCL) are profitable
     because underdogs are systematically undervalued at low prices.
     """
     market_prob = market_price_cents / 100.0
-    
+
     # Category-specific base rate (implied from historical win rate)
     # EPL wins 42% of trades overall, UCL 33% - these are low win rates
     # but profitable because they buy cheap underdogs
@@ -137,7 +155,7 @@ def estimate_true_probability(ticker, market_price_cents, category):
         "UCLGAME-": 0.33,
     }
     cat_base = cat_rates.get(category, 0.50)
-    
+
     # Price-based adjustment: in profitable categories, underdogs are undervalued
     # and favorites are overvalued
     if market_price_cents <= 35:
@@ -152,11 +170,11 @@ def estimate_true_probability(ticker, market_price_cents, category):
         price_adjustment = -0.05
     else:
         price_adjustment = 0.0
-    
+
     # Blend market price with category base rate
     # Give market 60% weight, category base 40% weight
     blended = (market_prob * 0.6) + (cat_base * 0.4)
-    
+
     true_prob = blended + price_adjustment
     return max(0.05, min(0.95, true_prob))
 
@@ -165,24 +183,24 @@ def evaluate_market(ticker, ask_cents, bankroll, calculator):
     category = get_category(ticker)
     if not category:
         return None
-    
+
     if category not in ALLOWED_MARKETS:
         return None
-    
+
     if ask_cents < MIN_PRICE or ask_cents > MAX_PRICE:
         return None
-    
+
     # Estimate true probability
     true_prob = estimate_true_probability(ticker, ask_cents, category)
-    
+
     # Check YES side edge
     has_edge_yes, ev_yes, edge_pct_yes = calculator.has_edge(ask_cents, true_prob)
-    
+
     # Check NO side edge (price = 100 - ask)
     no_price = 100 - ask_cents
     no_true_prob = 1 - true_prob
     has_edge_no, ev_no, edge_pct_no = calculator.has_edge(no_price, no_true_prob)
-    
+
     # Pick the better side
     if has_edge_yes and ev_yes >= has_edge_no and ev_yes >= MIN_EV_PER_CONTRACT:
         side = "yes"
@@ -206,7 +224,7 @@ def evaluate_market(ticker, ask_cents, bankroll, calculator):
             "contracts": contracts, "ev": ev, "edge_pct": edge_pct,
             "true_prob": no_true_prob, "category": category
         }
-    
+
     return None
 
 
@@ -217,13 +235,13 @@ def place_order(client, rec):
         price_cents = rec["price"]
         contracts = rec["contracts"]
         trade_cost = price_cents * contracts
-        
+
         if not can_trade(trade_cost):
             return False
-        
+
         result = client.create_order(ticker, side, contracts, price_cents)
         success = result.get("order", {}).get("status") in ["resting", "executed", "confirmed"]
-        
+
         if success:
             record_spend(trade_cost)
             action_str = "BUY YES" if side == "yes" else "BUY NO"
@@ -243,32 +261,41 @@ async def main():
     private_key = load_key()
     calculator = EdgeCalculator(min_ev=MIN_EV_PER_CONTRACT)
     client = KalshiClient()
-    
+
     bal = client.balance()
     bankroll = (bal.get("balance", 0) + bal.get("portfolio_value", 0)) / 100.0
     cash = bal.get("balance", 0) / 100.0
-    
+
     print(f"Bankroll: ${bankroll:.2f} | Cash: ${cash:.2f}", flush=True)
     telegram(f"🚀 LIVE BOT v2 STARTED\nBankroll: ${bankroll:.2f}\nCategories: {ALLOWED_MARKETS}")
-    
+
     if cash < MIN_CASH_BALANCE:
         telegram("🛑 Cash below minimum. Stopping.")
         return
-    
+
     can_continue, loss = check_loss_limit(bal.get("balance", 0))
     if not can_continue:
         telegram(f"🛑 Daily loss limit hit: ${loss:.2f}")
         return
-    
+
+    # Load existing positions before scanning
+    existing_positions = get_existing_positions_by_base(client)
+    print(f"Loaded {len(existing_positions)} base markets with existing positions", flush=True)
+
     traded_markets = set()
     trades_count = 0
     daily_blocked = False
     opportunities = []
-    
+
+    # Pre-populate traded_markets with bases that already have positions
+    for base in existing_positions:
+        traded_markets.add(base)
+        print(f"  -> BLOCKING {base} (already have position)", flush=True)
+
     # Connect WebSocket
     ts = str(int(time.time() * 1000))
     sig = sign(private_key, ts + "GET" + "/trade-api/ws/v2")
-    
+
     ws = await websockets.connect(
         WS_URL,
         additional_headers={
@@ -277,10 +304,10 @@ async def main():
             "KALSHI-ACCESS-TIMESTAMP": ts
         }
     )
-    
+
     await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker"]}}))
     print("Connected! Scanning...", flush=True)
-    
+
     count = 0
     async for msg in ws:
         try:
@@ -290,32 +317,32 @@ async def main():
                 ticker = d.get("market_ticker", "")
                 ask = float(d.get("yes_ask_dollars", 0))
                 ask_cents = int(ask * 100)
-                
+
                 if ask_cents > 0:
                     opportunities.append((ticker, ask_cents))
-                
+
                 count += 1
                 if count >= 600:
                     break
         except:
             continue
-    
+
     await ws.close()
-    
+
     print(f"Scanned {len(opportunities)} markets", flush=True)
-    
+
     # Evaluate opportunities
     edges = []
     for ticker, ask_cents in opportunities:
         base = get_base_market(ticker)
         if base in traded_markets:
             continue
-        
+
         rec = evaluate_market(ticker, ask_cents, bankroll, calculator)
         if rec:
             rec["base"] = base
             edges.append(rec)
-    
+
     # Sort by EV, deduplicate by base market
     edges.sort(key=lambda x: x["ev"], reverse=True)
     seen_bases = set()
@@ -324,26 +351,36 @@ async def main():
         if e["base"] not in seen_bases:
             seen_bases.add(e["base"])
             final_edges.append(e)
-    
+
     top = final_edges[:MAX_BETS_PER_RUN]
-    
+
     print(f"Found {len(final_edges)} edges, placing top {len(top)}", flush=True)
-    
+
     for rec in top:
         if trades_count >= MAX_BETS_PER_RUN or daily_blocked:
             break
-        
+
+        # Belt-and-suspenders: re-check existing positions before each trade
+        base = rec['base']
+        current_positions = get_existing_positions_by_base(client)
+        if base in current_positions:
+            print(f"SKIP: Already have position in {base} (detected at placement time)", flush=True)
+            continue
+        if base in traded_markets:
+            print(f"SKIP: {base} already traded this run", flush=True)
+            continue
+
         print(f"Placing: {rec['ticker']} {rec['side'].upper()} @ {rec['price']}¢ EV=${rec['ev']:.2f}", flush=True)
         if place_order(client, rec):
             traded_markets.add(rec["base"])
             trades_count += 1
         else:
-            if not can_trade(rec["price"] * rec["contracts"]):
+            if not can_trade(rec['price'] * rec['contracts']):
                 daily_blocked = True
                 telegram("⛔ Daily trade cap reached!")
                 break
         await asyncio.sleep(0.5)
-    
+
     summary = f"🏁 BOT v2 DONE | {trades_count} bets placed"
     if daily_blocked:
         summary += " (cap hit)"
